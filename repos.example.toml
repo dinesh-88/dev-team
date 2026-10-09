@@ -1,0 +1,24 @@
+# Write repos.toml with `devteam setup <folder>`, or copy this file and list your repos by hand.
+# Paths can be absolute, start with ~, or be relative to this file.
+
+[[repo]]
+name = "backend"                      # short name the agents use
+path = "~/code/my-backend"
+description = "REST API (Python, FastAPI). Owns the database models and the /api/v1 endpoints."
+test = "pytest -q"                    # run by QA inside the worktree; leave out to skip tests
+setup = "pip install -e ."            # optional: run once in the fresh worktree before the tests
+base = "main"                         # optional: branch to start from (default: what is checked out)
+timeout = 900                         # optional: seconds allowed for setup and for tests
+
+[[repo]]
+name = "web"
+path = "~/code/my-web-app"
+description = "React front end (TypeScript). Calls the backend through src/api/client.ts."
+setup = "npm ci"
+test = "npm test -- --watchAll=false"
+
+[[repo]]
+name = "sdk"
+path = "~/code/my-python-sdk"
+description = "Python SDK that wraps the backend API for customers."
+test = "pytest -q"

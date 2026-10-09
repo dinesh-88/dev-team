@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Your local config and the team's output
+repos.toml
+repos.toml.bak
+repos.surveyed.toml
+.devteam/
+runs/
