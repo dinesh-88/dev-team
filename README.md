@@ -93,6 +93,31 @@ Start with a small, low-risk request and read the diffs. When it finishes you ge
 Nothing is pushed and your checked-out files are not touched. Review with the
 `git diff` command printed at the end, then merge or delete the branch.
 
+## Watch the agents work
+
+`devteam run` prints one line per step. For the full story per agent (what it
+was asked, what the model says, each tool call, the results), follow its log
+in another terminal, from the same folder:
+
+```bash
+devteam watch planner        # or: coder, qa, coder:web (one repo), or nothing for all
+devteam watch coder --next   # open it before `devteam run`; waits for the run to start
+devteam run --terminals "…"  # macOS: opens a Terminal window per agent for you
+```
+
+In VS Code, split the terminal panel and run one `devteam watch` in each.
+The logs stay in `.devteam/runs/<run>/logs/`, so `devteam watch --run <folder>`
+replays a finished run.
+
+## Parallel work
+
+The planner says which repos must wait for which (`after`: a consumer waits
+for the API it uses). Repos that do not wait for each other are coded at the
+same time, and fixes after QA run in parallel too. QA runs every repo's tests
+at once. `--parallel N` caps how many coder conversations run together
+(default 3; `--parallel 1` is one by one). Each parallel conversation uses
+the model at the same time, so on a subscription the limits are reached sooner.
+
 Other settings: `TEAM_MODEL` to pick a model (default: `claude-sonnet-5-5` for
 `api`, your Claude Code default for `subscription`), `--keep` to leave the
 worktree folders in place.
@@ -101,8 +126,9 @@ worktree folders in place.
 
 - **Contract.** The planner writes down what the repos must agree on (field
   names, endpoints, types). Every coder and QA gets it.
-- **Order.** The planner lists providers before consumers. Each later coder
-  receives the earlier repos' diffs and can read their new code.
+- **Order.** The planner lists providers before consumers and says which repo
+  waits for which. A coder receives the diffs of the repos finished before it
+  and can read their new code; independent repos are coded in parallel.
 - **Worktrees.** Each repo gets a separate working folder on the new branch
   (`git worktree`), so your own checkout stays as it is.
 - **QA across repos.** Tests run per repo with the command from `repos.toml`.
@@ -118,7 +144,8 @@ worktree folders in place.
 | Data part | Structured JSON next to the text | the plan (`devteam/planner.py`), the verdict (`devteam/qa.py`) |
 | Task | The server's record of one piece of work, with a state | `TeamAgent.execute()` in `devteam/a2a_server.py` |
 | Artifact | The result attached to a task | `updater.add_artifact(...)` in each agent |
-| Streaming | Live status events while the agent works | `tool_reporter()` in `devteam/a2a_server.py`, the `async for` loop in `devteam/orchestrator.py` |
+| Streaming | Live status events while the agent works | `reporters()` in `devteam/a2a_server.py`, the `async for` loop in `send()` in `devteam/orchestrator.py` |
+| Metadata | Free-form fields for extensions; ours tags status messages as `tool` or `text` | `say()` in `devteam/a2a_server.py`, read in `send()` |
 | Context | `context_id` links follow-up messages to earlier ones | `devteam/coder.py`: one conversation per repo, reused for fixes |
 
 Reading order (all in `devteam/`): `a2a_server.py` → `planner.py` →
@@ -170,7 +197,7 @@ a data part in `artifacts`.
 
 ## Exercises
 
-1. Run the coders for independent repos in parallel with `asyncio.gather`.
+1. Show the run in a web page: serve `.devteam/runs/` and stream the logs.
 2. Let the planner ask you a question: call `updater.requires_input(...)` and
    handle the `input_required` state in the orchestrator.
 3. Add another agent that opens pull requests for the finished branches.

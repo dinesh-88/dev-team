@@ -5,8 +5,9 @@ Run on its own with:  devteam agent planner   (or python -m devteam.planner)
 Incoming message:  text part = the request
                    data part = {"repos": [{"name", "path", "description"}]}
 Result artifact:   "plan" data part =
-                   {"summary", "contract", "repos": [{"name", "steps"}]}
-                   The order of "repos" is the order to implement them in.
+                   {"summary", "contract", "repos": [{"name", "steps", "after"}]}
+                   "after" names the repos that must be finished first; repos
+                   that do not wait for each other can be implemented in parallel.
 """
 
 from a2a.helpers import get_data_parts, new_data_part
@@ -27,7 +28,10 @@ Then call submit_plan with:
   types, endpoints, versions. The coders work one repo at a time and rely on this.
 - repos: ONLY the repos that need changes, ordered so that providers (APIs,
   libraries, schemas) come before their consumers. For each, concrete steps
-  naming real files and functions, including which tests to add or update.
+  naming real files and functions, including which tests to add or update,
+  and `after`: the repos in this plan whose new code it uses and that must be
+  finished first. Repos with nothing in common get an empty `after` and are
+  built at the same time.
 
 You cannot change files. Keep the plan as small as the request allows."""
 
@@ -48,6 +52,8 @@ def finish_tool(repo_names: list[str]) -> dict:
                         "properties": {
                             "name": {"type": "string", "enum": repo_names},
                             "steps": {"type": "string"},
+                            "after": {"type": "array", "items": {"type": "string",
+                                                                 "enum": repo_names}},
                         },
                         "required": ["name", "steps"],
                     },
@@ -68,7 +74,7 @@ class Planner(TeamAgent):
         chat = brain.Conversation(SYSTEM, toolbox, finish_tool(sorted(toolbox.roots)))
         plan = await chat.ask(
             f"Request:\n{request}\n\nRepositories:\n{listing}",
-            on_tool=self.tool_reporter(context, updater), mock=mock.PLANNER,
+            **self.reporters(context, updater), mock=mock.PLANNER,
         )
 
         # A data part carries structured JSON, so the caller can use the plan
@@ -83,7 +89,7 @@ CARD = build_card(
         id="plan",
         name="Plan a multi-repo change",
         description="Send the request as text and {repos:[{name,path,description}]} as data. "
-        "Returns a `plan` data artifact: {summary, contract, repos:[{name, steps}]}.",
+        "Returns a `plan` data artifact: {summary, contract, repos:[{name, steps, after}]}.",
         tags=["planning", "multi-repo"],
     ),
 )

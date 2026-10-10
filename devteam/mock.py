@@ -19,7 +19,8 @@ PLANNER = [
             {"name": "backend", "steps": "Store an email per user in users.py, return it "
                                          "from get_user(), and update test_users.py."},
             {"name": "client", "steps": "format_user() in display.py renders "
-                                        "'Name <email> (#id)'. Update test_display.py."},
+                                        "'Name <email> (#id)'. Update test_display.py.",
+             "after": ["backend"]},
         ],
     }),
 ]

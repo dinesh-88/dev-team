@@ -6,18 +6,24 @@ learns from their Agent Cards. For one request it:
   1. asks the Planner which repos must change, in which order, and what they
      must agree on (the "contract")
   2. opens one Coder conversation per repo, each in a fresh git worktree on a
-     shared branch name
+     shared branch name. Repos that do not wait for each other are coded at
+     the same time (up to `parallel` conversations at once).
   3. asks QA to run every repo's tests and review the change as a whole
   4. sends failures back to the right repo's Coder conversation, up to
      MAX_ROUNDS times
+
+Every event an agent streams is also written to <run>/logs/<agent>.log, which
+`devteam watch` follows in another terminal.
 
 `devteam run "..."` starts the agents and calls run_team() for you.
 """
 
 import asyncio
+import json
 import re
 import sys
 import tomllib
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +32,7 @@ from a2a.client import ClientConfig, create_client
 from a2a.helpers import (
     get_data_parts,
     get_message_text,
+    get_text_parts,
     new_data_part,
     new_message,
     new_text_part,
@@ -77,23 +84,61 @@ def load_repos(config_path: str | Path) -> dict[str, dict]:
 
 # ---- talking A2A ------------------------------------------------------------
 
-async def send(client, who: str, parts: list[Part], context_id: str | None = None) -> Task:
+class RunLog:
+    """One log file per agent conversation, e.g. logs/coder-web.log."""
+
+    def __init__(self, folder: Path):
+        self.folder = folder
+        folder.mkdir(parents=True, exist_ok=True)
+
+    def write(self, who: str, text: str) -> None:
+        body = text.rstrip().replace("\n", "\n" + " " * 10)
+        path = self.folder / (who.replace(":", "-") + ".log")
+        with path.open("a", encoding="utf-8") as file:
+            file.write(f"{datetime.now():%H:%M:%S}  {body}\n")
+
+
+def describe(parts, limit: int = 4000) -> str:
+    """Text and data parts as readable text, for the logs."""
+    lines = ["\n".join(get_text_parts([part])) for part in parts if part.HasField("text")]
+    lines += [json.dumps(data, indent=2, ensure_ascii=False) for data in get_data_parts(parts)]
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[:limit] + f"\n... ({len(text) - limit} more characters)"
+
+
+async def send(client, who: str, parts: list[Part], context_id: str | None = None,
+               log: RunLog | None = None) -> Task:
     """Send one message to an agent, print its live updates, return the finished Task."""
     message = new_message(parts, context_id=context_id, role=Role.ROLE_USER)
     task_id = None
 
+    def note(text: str, show: bool = True) -> None:
+        if show:
+            print(f"  [{who}] {text}")
+        if log:
+            log.write(who, text)
+
+    note(f"<< message from the orchestrator >>\n{describe(parts)}", show=False)
     # send_message() streams events back while the agent works.
     async for event in client.send_message(SendMessageRequest(message=message)):
         if event.HasField("task"):  # the agent accepted the work and created a Task
             task_id = event.task.id
-            print(f"  [{who}] task {task_id[:8]} created")
+            note(f"task {task_id[:8]} created")
         elif event.HasField("status_update"):  # state changes and progress notes
             status = event.status_update.status
             state = TaskState.Name(status.state).removeprefix("TASK_STATE_").lower()
-            note = get_message_text(status.message) if status.HasField("message") else ""
-            print(f"  [{who}] {state}" + (f": {note}" if note else ""))
+            text, kind = "", None
+            if status.HasField("message"):
+                text = get_message_text(status.message)
+                kind = dict(status.message.metadata).get("kind")
+            if kind == "text":  # the model talking: only in the log, it is long
+                note(f"says: {text}", show=False)
+            else:
+                note(state + (f": {text}" if text else ""))
         elif event.HasField("artifact_update"):  # a piece of the result arrived
-            print(f"  [{who}] artifact: {event.artifact_update.artifact.name}")
+            artifact = event.artifact_update.artifact
+            note(f"artifact: {artifact.name}")
+            note(describe(artifact.parts), show=False)
 
     if task_id is None:
         raise AgentError(f"{who} did not create a task")
@@ -102,8 +147,16 @@ async def send(client, who: str, parts: list[Part], context_id: str | None = Non
     task = await client.get_task(GetTaskRequest(id=task_id))
     if task.status.state != TaskState.TASK_STATE_COMPLETED:
         reason = get_message_text(task.status.message) if task.status.HasField("message") else ""
+        note(f"FAILED: {reason}", show=False)
         raise AgentError(f"{who} did not complete the task. {reason}")
     return task
+
+
+async def all_of(jobs: list[Awaitable]) -> None:
+    """Run jobs at the same time; when all are done, raise the first error if any."""
+    for result in await asyncio.gather(*jobs, return_exceptions=True):
+        if isinstance(result, BaseException):
+            raise result
 
 
 def data_artifact(task: Task, name: str) -> dict:
@@ -116,6 +169,14 @@ def data_artifact(task: Task, name: str) -> dict:
 
 def slugify(text: str) -> str:
     return "-".join(re.findall(r"[a-z0-9]+", text.lower())[:6])[:40].strip("-") or "change"
+
+
+def next_wave(remaining: list[dict]) -> list[dict]:
+    """The planned repos whose `after` repos are all finished (not still remaining)."""
+    waiting = {step["name"] for step in remaining}
+    ready = [step for step in remaining
+             if not (set(step.get("after", [])) - {step["name"]}) & waiting]
+    return ready or remaining[:1]  # a dependency cycle: just take them in plan order
 
 
 def coder_brief(request: str, plan: dict, step: dict, done: dict[str, dict]) -> str:
@@ -141,14 +202,22 @@ def feedback(name: str, result: dict) -> str:
 
 
 async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
-                   keep_worktrees: bool = False) -> bool:
-    """`urls` has the address of the "planner", "coder" and "qa" agents."""
+                   keep_worktrees: bool = False, parallel: int = 3,
+                   on_start: Callable[[Path], None] | None = None) -> bool:
+    """`urls` has the address of the "planner", "coder" and "qa" agents.
+
+    `parallel` is how many coder conversations may run at once. `on_start` is
+    called with the run folder as soon as it exists.
+    """
     repos = load_repos(config_path)
     stamp = datetime.now()
     branch = f"team/{slugify(request)}-{stamp:%H%M%S}"
     run_dir = (Path(config_path).resolve().parent / STATE_DIR / "runs"
                / f"{stamp:%Y%m%d-%H%M%S}-{slugify(request)}")
     run_dir.mkdir(parents=True)
+    log = RunLog(run_dir / "logs")
+    if on_start:
+        on_start(run_dir)
 
     # Agents can take minutes, so no read timeout (httpx defaults to 5 seconds).
     http = httpx.AsyncClient(timeout=httpx.Timeout(30, read=None))
@@ -169,14 +238,16 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
                 {"name": r["name"], "path": r["path"], "description": r["description"]}
                 for r in repos.values()
             ]}),
-        ])
+        ], log=log)
         plan = data_artifact(task, "plan")
         unknown = [step["name"] for step in plan["repos"] if step["name"] not in repos]
         if unknown:
             raise AgentError(f"The plan names repos that are not in the config: {unknown}")
         plan_text = (
             f"# Plan\n\n{plan['summary']}\n\n## Contract\n\n{plan['contract']}\n\n"
-            + "\n\n".join(f"## {step['name']}\n\n{step['steps']}" for step in plan["repos"])
+            + "\n\n".join(f"## {step['name']}\n\n"
+                          + (f"After: {', '.join(step['after'])}\n\n" if step.get("after") else "")
+                          + step["steps"] for step in plan["repos"])
         )
         (run_dir / "plan.md").write_text(plan_text + "\n", encoding="utf-8")
         print(f"  -> {len(plan['repos'])} repo(s): {', '.join(s['name'] for s in plan['repos']) or 'none'}")
@@ -185,22 +256,37 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
             return True
 
         print("\n2. Coder")
-        for step in plan["repos"]:
-            name, repo = step["name"], repos[step["name"]]
-            worktree = run_dir / "worktrees" / name
-            base = gitops.add_worktree(repo["path"], worktree, branch, repo["base"])
-            # The coder may READ every other repo: changed ones through their
-            # worktree (so it sees the new code), the rest through your checkout.
-            read_only = {other: work[other]["worktree"] if other in work else repos[other]["path"]
-                         for other in repos if other != name}
-            brief = coder_brief(request, plan, step, work)
-            work[name] = {"worktree": str(worktree), "base": base}
-            task = await send(coder, f"coder:{name}", [
-                new_text_part(brief),
-                new_data_part({"repo": name, "worktree": str(worktree), "base": base,
-                               "read_only": read_only}),
-            ])
+        limit = asyncio.Semaphore(max(1, parallel))
+
+        async def code(name: str, parts: list[Part], context_id: str | None = None) -> None:
+            async with limit:
+                task = await send(coder, f"coder:{name}", parts, context_id, log)
             work[name]["context_id"] = task.context_id  # one conversation per repo
+
+        remaining = list(plan["repos"])
+        while remaining:
+            # A wave: every repo whose dependencies are done. They run together.
+            wave = next_wave(remaining)
+            remaining = [step for step in remaining if step not in wave]
+            finished = dict(work)
+            print(f"  -> now: {', '.join(step['name'] for step in wave)}")
+            jobs = []
+            for step in wave:
+                name, repo = step["name"], repos[step["name"]]
+                worktree = run_dir / "worktrees" / name
+                base = gitops.add_worktree(repo["path"], worktree, branch, repo["base"])
+                # The coder may READ every other repo: finished ones through their
+                # worktree (so it sees the new code), the rest through your checkout.
+                read_only = {other: finished[other]["worktree"] if other in finished
+                             else repos[other]["path"] for other in repos if other != name}
+                brief = coder_brief(request, plan, step, finished)
+                work[name] = {"worktree": str(worktree), "base": base}
+                jobs.append(code(name, [
+                    new_text_part(brief),
+                    new_data_part({"repo": name, "worktree": str(worktree), "base": base,
+                                   "read_only": read_only}),
+                ]))
+            await all_of(jobs)
 
         qa_brief = (f"Request:\n{request}\n\nPlan summary:\n{plan['summary']}\n\n"
                     f"Contract shared by all repositories:\n{plan['contract']}")
@@ -215,7 +301,7 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
             print(f"\n3. QA (round {round_number})")
             # Reusing QA's context_id tells it the worktrees are already set up.
             task = await send(qa, "qa", [new_text_part(qa_brief),
-                                         new_data_part({"repos": qa_repos})], qa_context)
+                                         new_data_part({"repos": qa_repos})], qa_context, log)
             qa_context = task.context_id
             verdict = data_artifact(task, "verdict")
             for name, result in verdict["repos"].items():
@@ -224,11 +310,12 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
                 break
 
             print("\n2. Coder (fix)")
-            for name, result in verdict["repos"].items():
-                if result["tests"] == "failed" or result["issues"]:
-                    # Same context_id: this coder remembers the plan and its own work.
-                    await send(coder, f"coder:{name}", [new_text_part(feedback(name, result))],
-                               work[name]["context_id"])
+            # Same context_id: each coder remembers the plan and its own work.
+            await all_of([
+                code(name, [new_text_part(feedback(name, result))], work[name]["context_id"])
+                for name, result in verdict["repos"].items()
+                if result["tests"] == "failed" or result["issues"]
+            ])
     finally:
         await asyncio.gather(planner.close(), coder.close(), qa.close(), return_exceptions=True)
         report = finish(run_dir, repos, work, branch, verdict, keep_worktrees)

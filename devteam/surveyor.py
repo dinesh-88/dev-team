@@ -179,7 +179,7 @@ class Surveyor(TeamAgent):
         listing = "\n".join(f"- {key}: {path}" for key, path in roots.items())
         answer = await chat.ask(
             f"{context.get_user_input()}\n\nRepositories:\n{listing}",
-            on_tool=self.tool_reporter(context, updater), mock=mock.SURVEYOR,
+            **self.reporters(context, updater), mock=mock.SURVEYOR,
         )
 
         proposed = {entry["repo"]: entry for entry in answer["repos"] if entry["repo"] in roots}

@@ -100,12 +100,16 @@ class QA(TeamAgent):
         repos = get_data_parts(context.message.parts)[0]["repos"]
         setup_done = self.setup_done.setdefault(context.context_id, set())
 
-        # 1. Tests
-        results = {}
-        for repo in repos:
+        # 1. Tests, all repos at the same time (each in its own thread)
+        async def test(repo: dict) -> None:
             await self.progress(context, updater, f"{repo['name']}: running tests")
             status, output = await asyncio.to_thread(self.run_tests, repo, setup_done)
+            await self.progress(context, updater, f"{repo['name']}: tests {status}")
             results[repo["name"]] = {"tests": status, "output": output, "issues": []}
+
+        results = {}
+        await asyncio.gather(*(test(repo) for repo in repos))
+        results = {repo["name"]: results[repo["name"]] for repo in repos}  # keep config order
 
         # 2. Cross-repo review
         await self.progress(context, updater, "Reviewing the change across repos")
@@ -119,7 +123,7 @@ class QA(TeamAgent):
         chat = brain.Conversation(SYSTEM, toolbox, finish_tool(sorted(results)))
         review = await chat.ask(
             "\n\n".join(sections),
-            on_tool=self.tool_reporter(context, updater), mock=mock.REVIEW,
+            **self.reporters(context, updater), mock=mock.REVIEW,
         )
         for issue in review["issues"]:
             if issue["repo"] in results:

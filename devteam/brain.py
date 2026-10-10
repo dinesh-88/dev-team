@@ -47,24 +47,27 @@ class Conversation:
         self.messages: list[dict] = []  # api brain: the full history
         self.session_id: str | None = None  # subscription brain: Claude Code session
 
-    async def ask(self, text: str, on_tool=None, mock=None) -> dict:
+    async def ask(self, text: str, on_tool=None, on_text=None, mock=None) -> dict:
         """Send `text`, let the model work with the tools, return what it hands in.
 
         `on_tool(name, args)` is awaited before each tool call (for progress).
+        `on_text(text)` is awaited with each piece of text the model writes.
         `mock` is the canned list of tool calls for the mock brain.
         """
         if BRAIN == "mock":
             return await self._ask_mock(mock, on_tool)
         if BRAIN == "api":
-            return await self._ask_api(text, on_tool)
-        return await self._ask_subscription(text, on_tool)
+            return await self._ask_api(text, on_tool, on_text)
+        return await self._ask_subscription(text, on_tool, on_text)
 
     # ---- brain 1: Claude Code subscription, via the Claude Agent SDK ---------
 
-    async def _ask_subscription(self, text: str, on_tool) -> dict:
+    async def _ask_subscription(self, text: str, on_tool, on_text) -> dict:
         from claude_agent_sdk import (
+            AssistantMessage,
             ClaudeAgentOptions,
             ResultMessage,
+            TextBlock,
             create_sdk_mcp_server,
             query,
             tool,
@@ -104,6 +107,10 @@ class Conversation:
             async for message in query(prompt=text, options=options):
                 if isinstance(message, ResultMessage):
                     result = message
+                elif isinstance(message, AssistantMessage) and on_text:
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text.strip():
+                            await on_text(block.text)
             if result is None:
                 raise RuntimeError("Claude Code ended without a result.")
             self.session_id = result.session_id
@@ -121,7 +128,7 @@ class Conversation:
 
     # ---- brain 2: Anthropic API key ---------------------------------------
 
-    async def _ask_api(self, text: str, on_tool) -> dict:
+    async def _ask_api(self, text: str, on_tool, on_text) -> dict:
         global _api_client
         if _api_client is None:
             from anthropic import AsyncAnthropic
@@ -138,6 +145,10 @@ class Conversation:
                 tools=[*self.toolbox.specs(), self.finish],
             )
             self.messages.append({"role": "assistant", "content": response.content})
+            if on_text:
+                for block in response.content:
+                    if block.type == "text" and block.text.strip():
+                        await on_text(block.text)
             calls = [block for block in response.content if block.type == "tool_use"]
             if not calls:
                 self._add_user_text(f"Keep going, and call {self.finish['name']} when you are done.")

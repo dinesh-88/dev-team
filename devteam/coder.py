@@ -70,7 +70,7 @@ class Coder(TeamAgent):
         # Same Conversation object as last time, so the model remembers its earlier work.
         result = await state["chat"].ask(
             context.get_user_input(),
-            on_tool=self.tool_reporter(context, updater),
+            **self.reporters(context, updater),
             mock=mock.coder(repo, state["round"]),
         )
 

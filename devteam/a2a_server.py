@@ -72,22 +72,33 @@ class TeamAgent(AgentExecutor):
         await TaskUpdater(event_queue, context.task_id, context.context_id).cancel()
 
     @staticmethod
-    def say(context: RequestContext, text: str):
-        """Build an agent message tied to the current task."""
-        return new_text_message(text, context_id=context.context_id, task_id=context.task_id)
+    def say(context: RequestContext, text: str, kind: str | None = None):
+        """Build an agent message tied to the current task.
 
-    async def progress(self, context: RequestContext, updater: TaskUpdater, text: str) -> None:
+        `kind` goes into the message's metadata, which A2A leaves free for
+        extensions. Ours: "tool" (a tool call) or "text" (the model talking).
+        """
+        message = new_text_message(text, context_id=context.context_id, task_id=context.task_id)
+        if kind:
+            message.metadata.update({"kind": kind})
+        return message
+
+    async def progress(self, context: RequestContext, updater: TaskUpdater, text: str,
+                       kind: str | None = None) -> None:
         """(5) Stream a 'still working' update to the client."""
-        await updater.start_work(self.say(context, text))
+        await updater.start_work(self.say(context, text, kind))
 
-    def tool_reporter(self, context: RequestContext, updater: TaskUpdater):
-        """Returns a callback that streams each tool call the model makes."""
+    def reporters(self, context: RequestContext, updater: TaskUpdater) -> dict:
+        """Callbacks for brain.Conversation.ask() that stream what the model does."""
 
-        async def report(tool: str, args: dict) -> None:
+        async def on_tool(tool: str, args: dict) -> None:
             target = "/".join(str(args[key]) for key in ("repo", "path") if key in args)
-            await self.progress(context, updater, f"{tool} {target}".strip())
+            await self.progress(context, updater, f"{tool} {target}".strip(), "tool")
 
-        return report
+        async def on_text(text: str) -> None:
+            await self.progress(context, updater, text.strip(), "text")
+
+        return {"on_tool": on_tool, "on_text": on_text}
 
     @abstractmethod
     async def work(self, context: RequestContext, updater: TaskUpdater) -> None:

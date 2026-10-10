@@ -3,6 +3,7 @@
     devteam setup ~/code                 write ./repos.toml for the git repos in ~/code
     devteam run "Add an email field ..." change your repos (listed in repos.toml)
     devteam demo                         two tiny demo repos, no Claude needed
+    devteam watch coder                  follow one agent of the latest run (another terminal)
     devteam agent planner                run one agent on its own, e.g. to curl it
 
 `devteam <command> --help` shows the options of each command.
@@ -11,6 +12,7 @@
 import argparse
 import asyncio
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -24,11 +26,13 @@ if sys.version_info < (3, 11):
 import httpx
 
 from devteam import gitops
-from devteam.orchestrator import AgentError, load_repos, run_team, survey
+from devteam.orchestrator import STATE_DIR, AgentError, load_repos, run_team, survey
 
 PACKAGE_PARENT = Path(__file__).resolve().parent.parent
 CARD_PATH = "/.well-known/agent-card.json"
 CONFIG_NAME = "repos.toml"
+TEAM = ["planner", "coder", "qa"]  # the agents of `devteam run`
+COLORS = ["36", "33", "35", "32", "34", "31"]  # ANSI colors for the agents in `watch`
 USER_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "devteam" / CONFIG_NAME
 AGENTS = {
     "planner": "Reads the repos and splits a request into per-repo work (default port 9101)",
@@ -116,13 +120,88 @@ def choose_brain(parser: argparse.ArgumentParser, wanted: str | None, demo: bool
     return brain
 
 
+# ---- following a run ---------------------------------------------------------
+
+def runs_folder(config: Path) -> Path:
+    return config.resolve().parent / STATE_DIR / "runs"
+
+
+def latest_run(config: Path) -> Path | None:
+    folder = runs_folder(config)
+    runs = sorted(p for p in folder.iterdir() if p.is_dir()) if folder.is_dir() else []
+    return runs[-1] if runs else None  # names start with the date and time
+
+
+def watch_command(name: str, run_dir: Path, config: Path) -> str:
+    """The shortest `devteam watch` command that finds this run from the current folder."""
+    if find_config(None).resolve() == config.resolve():
+        return f"devteam watch {name}"
+    return f"devteam watch {name} --run {shlex.quote(str(run_dir))}"
+
+
+def open_terminals(run_dir: Path, names: list[str]) -> None:
+    """Open one macOS Terminal window per agent, each following its log."""
+    if sys.platform != "darwin":
+        print("--terminals opens macOS Terminal windows. Elsewhere, run the commands above yourself.")
+        return
+    for name in names:
+        command = (f"cd {shlex.quote(str(Path.cwd()))} && "
+                   f"PYTHONPATH={shlex.quote(str(PACKAGE_PARENT))} {shlex.quote(sys.executable)} "
+                   f"-m devteam watch {name} --run {shlex.quote(str(run_dir))}")
+        quoted = command.replace("\\", "\\\\").replace('"', '\\"')  # inside an AppleScript string
+        subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{quoted}"'],
+                       capture_output=True)
+
+
+def follow(run_dir: Path, agent: str | None) -> None:
+    """Print the run's log files as they grow. Stops when the run has finished."""
+    logs = run_dir / "logs"
+    want = agent.replace(":", "-") if agent else None
+    color = sys.stdout.isatty()
+    offsets: dict[Path, int] = {}
+    partial: dict[Path, bytes] = {}
+    print(f"Following {agent or 'all agents'} in {run_dir}\n(Ctrl+C to stop)\n", flush=True)
+    while True:
+        finished = (run_dir / "summary.md").exists()  # checked first, so no last lines are missed
+        printed = False
+        for number, path in enumerate(sorted(logs.glob("*.log"))):
+            if want and path.stem != want and not path.stem.startswith(want + "-"):
+                continue
+            with path.open("rb") as file:
+                file.seek(offsets.get(path, 0))
+                chunk = file.read()
+            if not chunk:
+                continue
+            offsets[path] = offsets.get(path, 0) + len(chunk)
+            *lines, partial[path] = (partial.get(path, b"") + chunk).split(b"\n")
+            prefix = "" if path.stem == want else f"[{path.stem}] "
+            if prefix and color:
+                prefix = f"\033[{COLORS[number % len(COLORS)]}m{prefix}\033[0m"
+            for line in lines:
+                print(prefix + line.decode("utf-8", "replace"), flush=True)
+            printed = True
+        if finished and not printed:
+            print(f"\nThe run has finished. Summary: {run_dir / 'summary.md'}")
+            return
+        time.sleep(0.3)
+
+
 # ---- the commands ------------------------------------------------------------
 
-def team(request: str, config: Path, keep: bool) -> int:
+def team(request: str, config: Path, keep: bool, parallel: int, terminals: bool) -> int:
     print(f"Request: {request}\nConfig:  {config}")
-    with agents_running(["planner", "coder", "qa"]) as urls:
+
+    def started(run_dir: Path) -> None:
+        print("\nFollow each agent in its own terminal:")
+        for name in TEAM:
+            print(f"  {watch_command(name, run_dir, config)}")
+        if terminals:
+            open_terminals(run_dir, TEAM)
+
+    with agents_running(TEAM) as urls:
         try:
-            return 0 if asyncio.run(run_team(request, config, urls, keep)) else 1
+            passed = asyncio.run(run_team(request, config, urls, keep, parallel, started))
+            return 0 if passed else 1
         except (AgentError, gitops.GitError) as error:
             print(f"\nStopped: {error}")
             return 1
@@ -145,7 +224,7 @@ def cmd_run(parser, args) -> int:
     config = find_config(args.config)
     load_repos(config)  # fail on a bad config before starting any agent
     choose_brain(parser, args.brain, demo=False)
-    return team(request, config, args.keep)
+    return team(request, config, args.keep, args.parallel, args.terminals)
 
 
 def cmd_setup(parser, args) -> int:
@@ -164,7 +243,27 @@ def cmd_demo(parser, args) -> int:
     request = " ".join(args.request)
     if brain == "mock" or not request:
         request = DEMO_REQUEST
-    return team(request, config, args.keep)
+    return team(request, config, args.keep, args.parallel, args.terminals)
+
+
+def cmd_watch(parser, args) -> int:
+    config = find_config(args.config)
+    if args.run:
+        run_dir = Path(args.run).expanduser()
+    elif args.next:  # wait for a run that has not started yet
+        before = latest_run(config)
+        print(f"Waiting for the next run in {runs_folder(config)} ...", flush=True)
+        while (run_dir := latest_run(config)) in (before, None):
+            time.sleep(0.5)
+    else:
+        run_dir = latest_run(config)
+        if run_dir is None:
+            parser.error(f"no runs yet in {runs_folder(config)} (use --next to wait for one)")
+    try:
+        follow(run_dir, args.agent)
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def cmd_agent(parser, args) -> int:
@@ -184,10 +283,14 @@ def main() -> int:
     brain = argparse.ArgumentParser(add_help=False)
     brain.add_argument("--brain", choices=BRAINS, help="how the agents think. Default: api if "
                        "ANTHROPIC_API_KEY is set, otherwise subscription (mock for demo)")
-    keep = argparse.ArgumentParser(add_help=False)
-    keep.add_argument("--keep", action="store_true", help="keep the worktree folders")
+    team_options = argparse.ArgumentParser(add_help=False)
+    team_options.add_argument("--keep", action="store_true", help="keep the worktree folders")
+    team_options.add_argument("--parallel", type=int, default=3, metavar="N",
+                      help="coder conversations at the same time (default 3, 1 = one by one)")
+    team_options.add_argument("--terminals", action="store_true",
+                      help="open a macOS Terminal window per agent that follows its log")
 
-    run = commands.add_parser("run", parents=[brain, keep], help="change your repos",
+    run = commands.add_parser("run", parents=[brain, team_options], help="change your repos",
                               description="Plan, implement and test a change across the repos "
                               "in repos.toml. Results go to branches team/<request>-<time>.")
     run.add_argument("request", nargs="+", help="what you want changed")
@@ -204,12 +307,23 @@ def main() -> int:
                            help=f"where to write it (default: ./{CONFIG_NAME}; an old one becomes .bak)")
     setup_cmd.set_defaults(handler=cmd_setup)
 
-    demo = commands.add_parser("demo", parents=[brain, keep], help="try it on two tiny repos",
+    demo = commands.add_parser("demo", parents=[brain, team_options], help="try it on two tiny repos",
                                description="Create two demo repos and run the team on them. "
                                "Needs no Claude unless you pass --brain.")
     demo.add_argument("request", nargs="*", help="your own request (not with the mock brain)")
     demo.add_argument("--setup", action="store_true", help="run the Surveyor on the demo repos instead")
     demo.set_defaults(handler=cmd_demo)
+
+    watch = commands.add_parser("watch", help="follow the agents of a run",
+                                description="Print an agent's log as it grows: what it was asked, "
+                                "what the model says, each tool call and the result. Run it in "
+                                "its own terminal per agent. Works on finished runs too.")
+    watch.add_argument("agent", nargs="?", help="planner, coder, qa or e.g. coder:web "
+                       "(default: all, interleaved)")
+    watch.add_argument("--next", action="store_true", help="wait for the next run to start")
+    watch.add_argument("--run", metavar="DIR", help="this run folder instead of the latest")
+    watch.add_argument("--config", help=f"find runs next to this repos.toml (default as `run`)")
+    watch.set_defaults(handler=cmd_watch)
 
     agent = commands.add_parser("agent", parents=[brain], help="run one agent on its own",
                                 description="Serve one agent until Ctrl+C, e.g. to read its "
