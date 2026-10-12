@@ -17,6 +17,9 @@ Read this file once and you have seen the whole server side of the protocol:
 """
 
 import argparse
+import os
+import threading
+import time
 from abc import abstractmethod
 
 import uvicorn
@@ -131,4 +134,15 @@ def main(card: AgentCard, agent: TeamAgent, default_port: int) -> None:
     """`python -m devteam.<agent> [--port N]`"""
     parser = argparse.ArgumentParser(description=card.description)
     parser.add_argument("--port", type=int, default=default_port)
-    serve(card, agent, parser.parse_args().port)
+    parser.add_argument("--parent", type=int, help="exit when this process (our starter) is gone")
+    args = parser.parse_args()
+    if args.parent:
+        threading.Thread(target=exit_with_parent, args=(args.parent,), daemon=True).start()
+    serve(card, agent, args.port)
+
+
+def exit_with_parent(parent: int) -> None:
+    """If `devteam` is killed hard it cannot stop us, so we notice and stop ourselves."""
+    while os.getppid() == parent:
+        time.sleep(1)
+    os._exit(0)

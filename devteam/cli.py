@@ -4,6 +4,8 @@
     devteam run "Add an email field ..." change your repos (listed in repos.toml)
     devteam demo                         two tiny demo repos, no Claude needed
     devteam watch coder                  follow one agent of the latest run (another terminal)
+    devteam status                       how the latest run is doing (--follow to keep watching)
+    devteam clean                        delete old runs and leftover worktrees
     devteam agent planner                run one agent on its own, e.g. to curl it
 
 `devteam <command> --help` shows the options of each command.
@@ -25,7 +27,7 @@ if sys.version_info < (3, 11):
 
 import httpx
 
-from devteam import gitops
+from devteam import cleanup, gitops, monitor
 from devteam.orchestrator import STATE_DIR, AgentError, load_repos, run_team, survey
 
 PACKAGE_PARENT = Path(__file__).resolve().parent.parent
@@ -70,7 +72,7 @@ def wait_until_up(url: str, process: subprocess.Popen, timeout: float = 30) -> N
 
 
 def agent_command(name: str, port: int) -> list[str]:
-    return [sys.executable, "-m", f"devteam.{name}", "--port", str(port)]
+    return [sys.executable, "-m", f"devteam.{name}", "--port", str(port), "--parent", str(os.getpid())]
 
 
 def agent_env() -> dict[str, str]:
@@ -266,6 +268,84 @@ def cmd_watch(parser, args) -> int:
     return 0
 
 
+def cmd_status(parser, args) -> int:
+    config = find_config(args.config)
+    if args.all:
+        folder = runs_folder(config)
+        print(monitor.overview(sorted(p for p in folder.iterdir() if p.is_dir())
+                               if folder.is_dir() else []))
+        return 0
+    run_dir = Path(args.run).expanduser() if args.run else latest_run(config)
+    if run_dir is None:
+        parser.error(f"no runs yet in {runs_folder(config)}")
+    if not args.follow:
+        print(monitor.report(run_dir))
+        return 0
+    try:
+        while True:
+            text = monitor.report(run_dir)
+            print("\033[H\033[2J" + text + "\n\n(refreshing every 2s, Ctrl+C to stop)", flush=True)
+            if monitor.state(run_dir, monitor.read_status(run_dir)) != "running":
+                return 0
+            time.sleep(2)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_clean(parser, args) -> int:
+    config = find_config(args.config)
+    runs = cleanup.find_runs(runs_folder(config))
+    doomed = cleanup.pick(runs, args.keep, args.older_than, args.all)
+    repos = load_repos(config) if config.is_file() else {}
+
+    merged: dict[str, list[str]] = {}
+    for name, repo in repos.items():
+        done, open_ = cleanup.team_branches(repo)
+        if args.branches and done:
+            merged[name] = done
+        for branch in open_:
+            print(f"Not merged, kept: {name} {branch}  (review it, or `git -C {repo['path']} "
+                  f"branch -D {branch}`)")
+
+    busy = [run for run in runs if run.busy]
+    for run in busy:
+        print(f"Skipped, may still be running: {run.path.name}")
+    if not doomed and not merged:
+        kept = "" if args.all else f", keeping the newest {args.keep}"
+        print(f"Nothing to clean in {runs_folder(config)} ({len(runs)} run(s){kept}).")
+        return 0
+
+    print(f"\nTo delete from {runs_folder(config)}:")
+    for run in doomed:
+        extra = f", {len(run.worktrees)} worktree(s)" if run.worktrees else ""
+        print(f"  {run.path.name}  ({cleanup.human_size(run.size)}{extra})")
+    for name, branches in merged.items():
+        print(f"  {name}: merged branches {', '.join(branches)}")
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("\nNothing deleted. Add --yes to delete without asking.")
+            return 1
+        if input("\nDelete these? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Nothing deleted.")
+            return 0
+
+    warnings, branches_deleted = [], 0
+    for run in doomed:
+        warnings += cleanup.remove_run(run)
+    for repo in repos.values():
+        cleanup.prune(repo)
+    for name, branches in merged.items():
+        deleted, problems = cleanup.delete_branches(repos[name], branches)
+        branches_deleted += deleted
+        warnings += problems
+    total = sum(run.size for run in doomed)
+    print(f"\nDeleted {len(doomed)} run(s), {cleanup.human_size(total)}"
+          + (f", and {branches_deleted} merged branch(es)" if merged else "") + ".")
+    for warning in warnings:
+        print(f"  note: {warning}")
+    return 0
+
+
 def cmd_agent(parser, args) -> int:
     choose_brain(parser, args.brain, demo=False, allow_mock=True)  # mock: answers for the demo repos
     port = args.port or {"planner": 9101, "coder": 9102, "qa": 9103, "surveyor": 9104}[args.name]
@@ -324,6 +404,31 @@ def main() -> int:
     watch.add_argument("--run", metavar="DIR", help="this run folder instead of the latest")
     watch.add_argument("--config", help=f"find runs next to this repos.toml (default as `run`)")
     watch.set_defaults(handler=cmd_watch)
+
+    status = commands.add_parser("status", help="how a run is doing",
+                                 description="Show a run's phase, each repo's state, whether the "
+                                 "agents still answer, and each conversation's latest activity. "
+                                 "Warns about conversations that have gone quiet.")
+    status.add_argument("--follow", "-f", action="store_true", help="refresh until the run ends")
+    status.add_argument("--all", action="store_true", help="one line per run instead")
+    status.add_argument("--run", metavar="DIR", help="this run folder instead of the latest")
+    status.add_argument("--config", help="runs next to this repos.toml (default as `run`)")
+    status.set_defaults(handler=cmd_status)
+
+    clean = commands.add_parser("clean", help="delete old runs and leftover worktrees",
+                                description="Delete old run folders (with any worktrees left in "
+                                "them) and forget deleted worktrees. Shows what it will delete "
+                                "and asks first. Unmerged team/* branches are never deleted.")
+    clean.add_argument("--keep", type=int, default=5, metavar="N",
+                       help="keep the newest N runs (default 5)")
+    clean.add_argument("--older-than", type=int, metavar="DAYS",
+                       help="only delete runs older than this")
+    clean.add_argument("--all", action="store_true", help="delete every run that is not running")
+    clean.add_argument("--branches", action="store_true",
+                       help="also delete team/* branches already merged into the base branch")
+    clean.add_argument("--yes", "-y", action="store_true", help="do not ask")
+    clean.add_argument("--config", help="runs next to this repos.toml (default as `run`)")
+    clean.set_defaults(handler=cmd_clean)
 
     agent = commands.add_parser("agent", parents=[brain], help="run one agent on its own",
                                 description="Serve one agent until Ctrl+C, e.g. to read its "

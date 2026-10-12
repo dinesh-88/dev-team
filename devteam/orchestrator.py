@@ -20,6 +20,7 @@ Every event an agent streams is also written to <run>/logs/<agent>.log, which
 
 import asyncio
 import json
+import os
 import re
 import sys
 import tomllib
@@ -96,6 +97,26 @@ class RunLog:
         path = self.folder / (who.replace(":", "-") + ".log")
         with path.open("a", encoding="utf-8") as file:
             file.write(f"{datetime.now():%H:%M:%S}  {body}\n")
+
+
+class RunStatus:
+    """<run>/status.json: where the run stands, read by `devteam status`."""
+
+    def __init__(self, path: Path, **fields):
+        self.path = path
+        self.data = {"pid": os.getpid(), "started": datetime.now().isoformat(timespec="seconds"),
+                     "phase": "starting", "repos": {}, **fields}
+        self.save()
+
+    def update(self, repos: dict[str, str] | None = None, **fields) -> None:
+        self.data["repos"].update(repos or {})
+        self.data.update(fields, updated=datetime.now().isoformat(timespec="seconds"))
+        self.save()
+
+    def save(self) -> None:
+        temporary = self.path.with_suffix(".tmp")  # write, then rename: readers never see half a file
+        temporary.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        temporary.replace(self.path)
 
 
 def describe(parts, limit: int = 4000) -> str:
@@ -216,6 +237,7 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
                / f"{stamp:%Y%m%d-%H%M%S}-{slugify(request)}")
     run_dir.mkdir(parents=True)
     log = RunLog(run_dir / "logs")
+    status = RunStatus(run_dir / "status.json", request=request, branch=branch, agents=urls)
     if on_start:
         on_start(run_dir)
 
@@ -232,6 +254,7 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
     verdict = None
     try:
         print("\n1. Planner")
+        status.update(phase="planning")
         task = await send(planner, "planner", [
             new_text_part(request),
             new_data_part({"repos": [
@@ -250,6 +273,7 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
                           + step["steps"] for step in plan["repos"])
         )
         (run_dir / "plan.md").write_text(plan_text + "\n", encoding="utf-8")
+        status.update(repos={step["name"]: "waiting" for step in plan["repos"]})
         print(f"  -> {len(plan['repos'])} repo(s): {', '.join(s['name'] for s in plan['repos']) or 'none'}")
         if not plan["repos"]:
             print("\nThe planner found nothing to change.")
@@ -259,10 +283,19 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
         limit = asyncio.Semaphore(max(1, parallel))
 
         async def code(name: str, parts: list[Part], context_id: str | None = None) -> None:
+            doing = "fixing" if context_id else "coding"
+            status.update(repos={name: f"queued for {doing}"})
             async with limit:
-                task = await send(coder, f"coder:{name}", parts, context_id, log)
+                status.update(repos={name: doing})
+                try:
+                    task = await send(coder, f"coder:{name}", parts, context_id, log)
+                except BaseException:
+                    status.update(repos={name: f"{doing} failed"})
+                    raise
+            status.update(repos={name: "fixed" if context_id else "coded"})
             work[name]["context_id"] = task.context_id  # one conversation per repo
 
+        status.update(phase="coding")
         remaining = list(plan["repos"])
         while remaining:
             # A wave: every repo whose dependencies are done. They run together.
@@ -299,6 +332,8 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
         qa_context = None
         for round_number in range(1, MAX_ROUNDS + 1):
             print(f"\n3. QA (round {round_number})")
+            status.update(phase=f"testing (round {round_number} of {MAX_ROUNDS})",
+                          repos={name: "testing" for name in work})
             # Reusing QA's context_id tells it the worktrees are already set up.
             task = await send(qa, "qa", [new_text_part(qa_brief),
                                          new_data_part({"repos": qa_repos})], qa_context, log)
@@ -306,20 +341,29 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
             verdict = data_artifact(task, "verdict")
             for name, result in verdict["repos"].items():
                 print(f"  -> {name}: tests {result['tests']}, {len(result['issues'])} review issue(s)")
+                status.update(repos={name: f"tests {result['tests']}, "
+                                           f"{len(result['issues'])} review issue(s)"})
             if verdict["passed"] or round_number == MAX_ROUNDS:
                 break
 
             print("\n2. Coder (fix)")
+            status.update(phase=f"fixing (after round {round_number})")
             # Same context_id: each coder remembers the plan and its own work.
             await all_of([
                 code(name, [new_text_part(feedback(name, result))], work[name]["context_id"])
                 for name, result in verdict["repos"].items()
                 if result["tests"] == "failed" or result["issues"]
             ])
+    except BaseException as error:  # also Ctrl+C
+        status.update(phase="stopped", error=f"{type(error).__name__}: {error}")
+        raise
     finally:
         await asyncio.gather(planner.close(), coder.close(), qa.close(), return_exceptions=True)
         report = finish(run_dir, repos, work, branch, verdict, keep_worktrees)
         (run_dir / "summary.md").write_text(report + "\n", encoding="utf-8")
+        if status.data["phase"] != "stopped":
+            status.update(phase="QA passed" if verdict and verdict["passed"]
+                          else "QA did not pass" if verdict else "nothing to change")
         print("\n" + report)
 
     return bool(verdict and verdict["passed"])

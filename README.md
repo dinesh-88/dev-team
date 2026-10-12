@@ -109,6 +109,27 @@ In VS Code, split the terminal panel and run one `devteam watch` in each.
 The logs stay in `.devteam/runs/<run>/logs/`, so `devteam watch --run <folder>`
 replays a finished run.
 
+## Status and cleanup
+
+```bash
+devteam status               # the latest run: phase, each repo, agents up?, latest activity
+devteam status -f            # keep refreshing until the run ends
+devteam status --all         # one line per run: running, finished or stopped
+devteam clean                # delete all but the newest 5 runs (asks first)
+devteam clean --older-than 7 --branches   # runs older than a week + merged team/* branches
+```
+
+`status` warns when a conversation has been quiet for 5 minutes and tells a
+crashed or killed run (`stopped`) from a running one. It reads
+`.devteam/runs/<run>/status.json`, the logs, and asks each agent for its card.
+
+`clean` removes leftover worktrees through git, so your repos do not keep
+stale entries, and never touches a run that is still going. Branches that are
+not merged are never deleted, only listed: they are your work to review.
+
+Neither uses a model. They are plain rules, and deleting things is not a
+decision to hand to one.
+
 ## Parallel work
 
 The planner says which repos must wait for which (`after`: a consumer waits
@@ -190,7 +211,8 @@ a data part in `artifacts`.
 - A fresh worktree has no installed dependencies (`node_modules`, virtual
   environments). Use `setup` in `repos.toml` to install them.
 - All agents must run on the machine that holds the repos, because they share
-  folders. Tasks and conversations live in memory only.
+  folders. Tasks and conversations live in memory only. Agents started by
+  `devteam` stop by themselves if `devteam` is killed.
 - There is no authentication. The agents listen on 127.0.0.1 only.
 - Usage grows with repo size and rounds, since every file an agent reads is
   sent to the model. On a subscription that eats into your plan's limits.
