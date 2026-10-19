@@ -197,7 +197,9 @@ the model at the same time, so on a subscription the limits are reached sooner.
 
 Other settings: `TEAM_MODEL` to pick a model (default: `claude-sonnet-5-5` for
 `api`, your Claude Code default for `subscription`), `--keep` to leave the
-worktree folders in place.
+worktree folders in place, `TEAM_MAX_TURNS` (default 60) for how many tool
+calls a model makes before it is told to carry on in the same conversation (up
+to 4 times, so 240 in all; raise it for big repos).
 
 ## How multi-repo works
 

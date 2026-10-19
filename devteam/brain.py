@@ -26,7 +26,8 @@ BRAIN = os.environ.get("TEAM_BRAIN") or (
 # api: defaults to Sonnet. subscription: defaults to whatever your Claude Code uses.
 MODEL = os.environ.get("TEAM_MODEL") or ("claude-sonnet-5-5" if BRAIN == "api" else None)
 MOCK_DELAY = float(os.environ.get("TEAM_MOCK_DELAY", "0"))
-MAX_TURNS = 60
+MAX_TURNS = int(os.environ.get("TEAM_MAX_TURNS", "60"))  # model turns (tool calls) per stretch
+STRETCHES = 4  # a model that runs out of turns may carry on this many times in all
 MAX_TOKENS = 16000
 
 if BRAIN == "subscription":
@@ -66,6 +67,7 @@ class Conversation:
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
+            ResultError,
             ResultMessage,
             TextBlock,
             create_sdk_mcp_server,
@@ -90,7 +92,7 @@ class Conversation:
             return handler
 
         specs = [*self.toolbox.specs(), self.finish]
-        for attempt in range(3):
+        for _ in range(STRETCHES):
             options = ClaudeAgentOptions(
                 system_prompt=self.system,
                 model=MODEL,
@@ -103,28 +105,45 @@ class Conversation:
                 max_turns=MAX_TURNS,
                 resume=self.session_id,  # continue the earlier session, if any
             )
-            result = None
-            async for message in query(prompt=text, options=options):
-                if isinstance(message, ResultMessage):
-                    result = message
-                elif isinstance(message, AssistantMessage) and on_text:
-                    for block in message.content:
-                        if isinstance(block, TextBlock) and block.text.strip():
-                            await on_text(block.text)
-            if result is None:
+            result, out_of_turns = None, False
+            try:
+                async for message in query(prompt=text, options=options):
+                    if isinstance(message, ResultMessage):
+                        result = message
+                    elif isinstance(message, AssistantMessage) and on_text:
+                        for block in message.content:
+                            if isinstance(block, TextBlock) and block.text.strip():
+                                await on_text(block.text)
+            except ResultError as error:  # newer SDKs raise for an error result
+                if error.subtype != "error_max_turns" or not error.session_id:
+                    raise RuntimeError(self._failed(error.result or str(error))) from error
+                self.session_id, out_of_turns = error.session_id, True
+            if result is not None:
+                self.session_id = result.session_id
+                if result.is_error:
+                    if result.subtype != "error_max_turns":
+                        raise RuntimeError(self._failed(
+                            result.result or ", ".join(result.errors or []) or result.subtype))
+                    out_of_turns = True
+            elif not out_of_turns:
                 raise RuntimeError("Claude Code ended without a result.")
-            self.session_id = result.session_id
-            if result.is_error:
-                detail = result.result or ", ".join(result.errors or []) or result.subtype
-                raise RuntimeError(
-                    f"Claude Code reported: {detail} (if this is a login problem, run "
-                    "`claude` once in a terminal and sign in with your subscription)"
-                )
             if "result" in handed_in:
                 return handed_in["result"]
+            if out_of_turns:
+                # Out of turns, not out of work: resume the same session, edits and all.
+                text = (f"You used your {MAX_TURNS} turns for this stretch. Carry on where you "
+                        f"left off, and call {self.finish['name']} when you are done.")
+                continue
             text = f"You have not called {self.finish['name']} yet. Finish the work and call it."
 
-        raise RuntimeError(f"The model never called {self.finish['name']}.")
+        raise RuntimeError(f"The model did not call {self.finish['name']} within "
+                           f"{STRETCHES} x {MAX_TURNS} turns. Raise TEAM_MAX_TURNS, or ask for a "
+                           "smaller change.")
+
+    @staticmethod
+    def _failed(detail: str) -> str:
+        return (f"Claude Code reported: {detail} (if this is a login problem, run "
+                "`claude` once in a terminal and sign in with your subscription)")
 
     # ---- brain 2: Anthropic API key ---------------------------------------
 
@@ -136,7 +155,7 @@ class Conversation:
             _api_client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY from the environment
 
         self._add_user_text(text)
-        for _ in range(MAX_TURNS):
+        for _ in range(MAX_TURNS * STRETCHES):  # the same budget as the subscription brain
             response = await _api_client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
@@ -169,7 +188,8 @@ class Conversation:
             if handed_in is not None:
                 return handed_in
 
-        raise RuntimeError(f"The model did not finish within {MAX_TURNS} turns.")
+        raise RuntimeError(f"The model did not finish within {MAX_TURNS * STRETCHES} turns. "
+                           "Raise TEAM_MAX_TURNS, or ask for a smaller change.")
 
     def _add_user_text(self, text: str) -> None:
         """Append user text, keeping user and assistant turns alternating."""
