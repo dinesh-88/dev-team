@@ -165,6 +165,32 @@ In VS Code, split the terminal panel and run one `devteam watch` in each.
 The logs stay in `.devteam/runs/<run>/logs/`, so `devteam watch --run <folder>`
 replays a finished run.
 
+## When a run stops: `devteam resume`
+
+A run that stops part-way (Ctrl+C, an error, a crash, a closed laptop) can carry on
+where it left off instead of starting over:
+
+```bash
+devteam resume                 # the latest run
+devteam resume --run DIR       # a particular one
+devteam resume --rounds 2      # 2 more QA rounds, also for a run that finished without passing
+```
+
+The run saves its progress in `status.json` after every step: the plan, which
+repos are coded, each QA round and its verdict. When it stops, its worktrees
+are kept, together with any edits an interrupted coder had not committed yet.
+`resume` starts fresh agents and:
+
+- reuses the plan, and does not code a repo again that was already coded
+- gives an interrupted coder its unfinished edits back: they are listed in its
+  brief and committed with its work
+- carries on with the QA round that was running, or the fixes it asked for
+
+The agents' conversations are lost when they stop, so a resumed coder starts a
+new one with the full brief. It sees its earlier work in the branch. The same
+branch name is used, so the result ends up in one place. `devteam ask` runs are
+checks and are not resumed: run the same command again.
+
 ## Status and cleanup
 
 ```bash
@@ -269,7 +295,8 @@ a data part in `artifacts`.
 - A fresh worktree has no installed dependencies (`node_modules`, virtual
   environments). Use `setup` in `repos.toml` to install them.
 - All agents must run on the machine that holds the repos, because they share
-  folders. Tasks and conversations live in memory only. Agents started by
+  folders. Tasks and conversations live in memory only (`devteam resume`
+  continues from what the run saved to disk). Agents started by
   `devteam` stop by themselves if `devteam` is killed.
 - There is no authentication. The agents listen on 127.0.0.1 only.
 - Usage grows with repo size and rounds, since every file an agent reads is

@@ -88,3 +88,28 @@ def add_detached(repo: str | Path, worktree: str | Path, commit: str) -> None:
 
 def drop_worktree(repo: str | Path, worktree: str | Path) -> None:
     git(repo, "worktree", "remove", "--force", str(worktree))
+
+
+# ---- picking up a stopped run (devteam resume) -------------------------------
+
+def uncommitted(worktree: str | Path) -> list[str]:
+    """Files changed, added or deleted since the last commit (ignored files left out)."""
+    output = git(worktree, "ls-files", "--modified", "--others", "--deleted", "--exclude-standard")
+    return sorted(set(output.splitlines()))
+
+
+def attach_worktree(repo: str | Path, worktree: str | Path, branch: str, base: str) -> None:
+    """Make sure `worktree` exists and is on `branch`: kept by a stopped run, or added again."""
+    if Path(worktree).is_dir():
+        try:
+            if git(worktree, "rev-parse", "--abbrev-ref", "HEAD") == branch:
+                return
+        except GitError:
+            pass
+        raise GitError(f"{worktree} exists but is not a worktree on {branch}. Move it away first.")
+    git(repo, "worktree", "prune")  # forget it, in case only its folder was deleted
+    try:
+        git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+        git(repo, "worktree", "add", str(worktree), branch)
+    except GitError:  # the branch had no commits, so it was removed
+        git(repo, "worktree", "add", "-b", branch, str(worktree), base)

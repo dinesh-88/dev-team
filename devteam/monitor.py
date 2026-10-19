@@ -57,7 +57,9 @@ def read_status(run_dir: Path) -> dict:
 
 
 def state(run_dir: Path, status: dict) -> str:
-    """running, finished or stopped (the process is gone without a summary)."""
+    """running, finished or stopped (by an error or Ctrl+C, or the process is gone without a summary)."""
+    if status.get("phase") == "stopped":
+        return "stopped"
     if (run_dir / "summary.md").exists():
         return "finished"
     return "running" if _alive(status.get("pid")) else "stopped"

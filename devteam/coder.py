@@ -56,6 +56,8 @@ class Coder(TeamAgent):
             info = get_data_parts(context.message.parts)[0]
             repo = info["repo"]
             toolbox = Toolbox({**info.get("read_only", {}), repo: info["worktree"]}, writable=[repo])
+            # Edits an interrupted earlier conversation left behind are this one's to commit.
+            toolbox.changed[repo].update(gitops.uncommitted(info["worktree"]))
             state = self.conversations[context.context_id] = {
                 "repo": repo,
                 "worktree": info["worktree"],
@@ -71,7 +73,7 @@ class Coder(TeamAgent):
         result = await state["chat"].ask(
             context.get_user_input(),
             **self.reporters(context, updater),
-            mock=mock.coder(repo, state["round"]),
+            mock=mock.coder(repo, state["worktree"]),
         )
 
         # Commit only the files the model touched through its tools.

@@ -138,7 +138,7 @@ async def ask(agents: list[str], targets: list[Target], message: str, config_pat
                / f"{stamp:%Y%m%d-%H%M%S}-{'-'.join(agents)}-{slugify(what)}")
     run_dir.mkdir(parents=True)
     log = RunLog(run_dir / "logs")
-    status = RunStatus(run_dir / "status.json", agents=urls,
+    status = RunStatus(run_dir / "status.json", kind="ask", agents=urls,
                        request=f"{', '.join(agents)} on {what}" + (f": {message}" if message else ""),
                        repos={f"{agent}:{t.name}": "waiting" for agent in agents for t in targets})
     if on_start:

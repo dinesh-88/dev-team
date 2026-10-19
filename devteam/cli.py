@@ -6,6 +6,7 @@
     devteam demo                         two tiny demo repos, no Claude needed
     devteam watch coder                  follow one agent of the latest run (another terminal)
     devteam status                       how the latest run is doing (--follow to keep watching)
+    devteam resume                       carry on with a run that stopped (Ctrl+C, crash, error)
     devteam clean                        delete old runs and leftover worktrees
     devteam agent planner                run one agent on its own, e.g. to curl it
 
@@ -30,7 +31,8 @@ import httpx
 
 from devteam import cleanup, gitops, monitor
 from devteam import ask
-from devteam.orchestrator import STATE_DIR, AgentError, load_repos, run_team, survey
+from devteam.orchestrator import (STATE_DIR, AgentError, can_resume, load_repos, new_run,
+                                  run_team, survey)
 
 PACKAGE_PARENT = Path(__file__).resolve().parent.parent
 CARD_PATH = "/.well-known/agent-card.json"
@@ -197,6 +199,12 @@ def follow(run_dir: Path, agent: str | None) -> None:
 
 def team(request: str, config: Path, keep: bool, parallel: int, terminals: bool) -> int:
     print(f"Request: {request}\nConfig:  {config}")
+    return drive(new_run(request, config), config, keep, parallel, terminals)
+
+
+def drive(run_dir: Path, config: Path, keep: bool, parallel: int, terminals: bool,
+          extra_rounds: int = 0) -> int:
+    """Start the team's agents and let them work on the run in `run_dir`, new or resumed."""
 
     def started(run_dir: Path) -> None:
         print("\nFollow each agent in its own terminal:")
@@ -207,11 +215,13 @@ def team(request: str, config: Path, keep: bool, parallel: int, terminals: bool)
 
     with agents_running(TEAM) as urls:
         try:
-            passed = asyncio.run(run_team(request, config, urls, keep, parallel, started))
+            passed = asyncio.run(run_team(run_dir, urls, keep, parallel, started, extra_rounds))
             return 0 if passed else 1
         except (AgentError, gitops.GitError) as error:
             print(f"\nStopped: {error}")
             return 1
+        except KeyboardInterrupt:
+            return 130  # the summary above says how to resume
 
 
 def setup(folder: str, out: Path, hints: str, only: list[str] | None) -> int:
@@ -314,6 +324,29 @@ def cmd_watch(parser, args) -> int:
     except KeyboardInterrupt:
         pass
     return 0
+
+
+def cmd_resume(parser, args) -> int:
+    config = find_config(args.config)
+    run_dir = Path(args.run).expanduser().resolve() if args.run else latest_run(config)
+    if run_dir is None:
+        parser.error(f"no runs yet in {runs_folder(config)}")
+    status = monitor.read_status(run_dir)
+    if monitor.state(run_dir, status) == "running":
+        parser.error(f"{run_dir.name} is still running (`devteam status` shows it)")
+    if not status.get("kind"):
+        parser.error(f"{run_dir.name} is from an older devteam that did not save its progress")
+    why = can_resume(run_dir)
+    if why and not (args.rounds and status.get("verdict") and not status["verdict"]["passed"]):
+        parser.error(f"cannot resume {run_dir.name}: {why}")
+    stored = status.get("brain")
+    choose_brain(parser, args.brain or stored, demo=False, allow_mock=stored == "mock")
+    done = (f"{status['qa_round']} QA round(s) done" if status.get("qa_round")
+            else "planned" if status.get("plan") else "not planned yet")
+    print(f"Run:     {run_dir.name}\nRequest: {status['request']}\nSo far:  {done}, "
+          f"stopped at: {status.get('error') or status.get('phase')}")
+    return drive(run_dir, Path(status["config"]), args.keep, args.parallel, args.terminals,
+                 args.rounds)
 
 
 def cmd_status(parser, args) -> int:
@@ -470,6 +503,18 @@ def main() -> int:
     watch.add_argument("--run", metavar="DIR", help="this run folder instead of the latest")
     watch.add_argument("--config", help=f"find runs next to this repos.toml (default as `run`)")
     watch.set_defaults(handler=cmd_watch)
+
+    resume = commands.add_parser(
+        "resume", parents=[brain, team_options], help="carry on with a run that stopped",
+        description="Continue a `devteam run` that was stopped (Ctrl+C, a crash, an error) "
+        "where it left off: the plan is reused, repos already coded are not coded again, "
+        "an interrupted coder gets its unfinished edits back, and QA goes on with the next "
+        "round. --rounds N also gives a run that did not pass QA N more rounds.")
+    resume.add_argument("--run", metavar="DIR", help="this run folder instead of the latest")
+    resume.add_argument("--rounds", type=int, default=0, metavar="N",
+                        help="N more QA rounds (also for a run that finished without passing)")
+    resume.add_argument("--config", help="runs next to this repos.toml (default as `run`)")
+    resume.set_defaults(handler=cmd_resume)
 
     status = commands.add_parser("status", help="how a run is doing",
                                  description="Show a run's phase, each repo's state, whether the "

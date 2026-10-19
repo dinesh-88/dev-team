@@ -110,6 +110,15 @@ class RunStatus:
                      "phase": "starting", "repos": {}, **fields}
         self.save()
 
+    @classmethod
+    def load(cls, path: Path, **fields) -> "RunStatus":
+        """Take over an existing run's status.json, as this process (for `devteam resume`)."""
+        status = cls.__new__(cls)
+        status.path = path
+        status.data = json.loads(path.read_text(encoding="utf-8"))
+        status.update(pid=os.getpid(), **fields)
+        return status
+
     def update(self, repos: dict[str, str] | None = None, **fields) -> None:
         self.data["repos"].update(repos or {})
         self.data.update(fields, updated=datetime.now().isoformat(timespec="seconds"))
@@ -237,22 +246,56 @@ def feedback(name: str, result: dict) -> str:
     return "\n\n".join(lines)
 
 
-async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
-                   keep_worktrees: bool = False, parallel: int = 3,
-                   on_start: Callable[[Path], None] | None = None) -> bool:
-    """`urls` has the address of the "planner", "coder" and "qa" agents.
-
-    `parallel` is how many coder conversations may run at once. `on_start` is
-    called with the run folder as soon as it exists.
-    """
-    repos = load_repos(config_path)
+def new_run(request: str, config_path: str | Path) -> Path:
+    """Create the run folder and its status.json. Returns the folder."""
     stamp = datetime.now()
-    branch = f"team/{slugify(request)}-{stamp:%H%M%S}"
     run_dir = (Path(config_path).resolve().parent / STATE_DIR / "runs"
                / f"{stamp:%Y%m%d-%H%M%S}-{slugify(request)}")
     run_dir.mkdir(parents=True)
+    RunStatus(run_dir / "status.json", kind="run", request=request,
+              brain=os.environ.get("TEAM_BRAIN"),
+              branch=f"team/{slugify(request)}-{stamp:%H%M%S}",
+              config=str(Path(config_path).resolve()), max_rounds=MAX_ROUNDS,
+              plan=None, work={}, qa_round=0, verdict=None)
+    return run_dir
+
+
+def can_resume(run_dir: Path) -> str:
+    """Why this run cannot be resumed, or '' if it can."""
+    data = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    if data.get("kind") != "run":
+        return ("only `devteam run` runs can be resumed. A `devteam ask` run is a "
+                "check: run the same `devteam ask` command again.")
+    verdict = data.get("verdict")
+    if verdict and verdict["passed"]:
+        return "this run has finished and QA passed."
+    if verdict and data["qa_round"] >= data["max_rounds"]:
+        return (f"QA did not pass after {data['qa_round']} rounds. "
+                "Add more with `devteam resume --rounds N`.")
+    return ""
+
+
+async def run_team(run_dir: Path, urls: dict[str, str], keep_worktrees: bool = False,
+                   parallel: int = 3, on_start: Callable[[Path], None] | None = None,
+                   extra_rounds: int = 0) -> bool:
+    """Plan, code and test, from wherever the run in `run_dir` stands.
+
+    For a new run (see new_run()) that is the beginning. For a resumed run,
+    every step recorded as done in status.json is skipped: the plan is reused,
+    coded repos are not coded again, and QA continues with the next round.
+
+    `urls` has the address of the "planner", "coder" and "qa" agents.
+    `parallel` is how many coder conversations may run at once. `on_start` is
+    called with the run folder before the agents get to work.
+    """
+    status = RunStatus.load(run_dir / "status.json", agents=urls, error=None)
+    st = status.data  # the run's memory: what is done, saved after every step
+    st["max_rounds"] += extra_rounds
+    request, branch = st["request"], st["branch"]
+    repos = load_repos(st["config"])
     log = RunLog(run_dir / "logs")
-    status = RunStatus(run_dir / "status.json", request=request, branch=branch, agents=urls)
+    (run_dir / "summary.md").unlink(missing_ok=True)  # it means "finished" to `devteam status`
+    resumed = bool(st["plan"])
     if on_start:
         on_start(run_dir)
 
@@ -265,70 +308,94 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
     coder = await create_client(urls["coder"], client_config=config)
     qa = await create_client(urls["qa"], client_config=config)
 
-    work: dict[str, dict] = {}  # repo name -> worktree, base, coder context, last change
-    verdict = None
+    work = st["work"]  # repo name -> {worktree, base, coded: QA round its work is done for}
+    contexts: dict[str, str] = {}  # repo name -> coder conversation. Not saved: agents forget.
     try:
-        print("\n1. Planner")
-        status.update(phase="planning")
-        task = await send(planner, "planner", [
-            new_text_part(request),
-            new_data_part({"repos": [
-                {"name": r["name"], "path": r["path"], "description": r["description"]}
-                for r in repos.values()
-            ]}),
-        ], log=log)
-        plan = data_artifact(task, "plan")
-        unknown = [step["name"] for step in plan["repos"] if step["name"] not in repos]
-        if unknown:
-            raise AgentError(f"The plan names repos that are not in the config: {unknown}")
-        (run_dir / "plan.md").write_text(plan_markdown(plan) + "\n", encoding="utf-8")
-        status.update(repos={step["name"]: "waiting" for step in plan["repos"]})
-        print(f"  -> {len(plan['repos'])} repo(s): {', '.join(s['name'] for s in plan['repos']) or 'none'}")
+        if resumed:
+            print(f"\nResuming {run_dir.name}")
+            for name, w in work.items():  # a finished run removed them; a stopped one kept them
+                gitops.attach_worktree(repos[name]["path"], w["worktree"], branch, w["base"])
+        else:
+            print("\n1. Planner")
+            status.update(phase="planning")
+            task = await send(planner, "planner", [
+                new_text_part(request),
+                new_data_part({"repos": [
+                    {"name": r["name"], "path": r["path"], "description": r["description"]}
+                    for r in repos.values()
+                ]}),
+            ], log=log)
+            plan = data_artifact(task, "plan")
+            unknown = [step["name"] for step in plan["repos"] if step["name"] not in repos]
+            if unknown:
+                raise AgentError(f"The plan names repos that are not in the config: {unknown}")
+            (run_dir / "plan.md").write_text(plan_markdown(plan) + "\n", encoding="utf-8")
+            status.update(plan=plan, repos={step["name"]: "waiting" for step in plan["repos"]})
+            print(f"  -> {len(plan['repos'])} repo(s): "
+                  f"{', '.join(s['name'] for s in plan['repos']) or 'none'}")
+        plan = st["plan"]
         if not plan["repos"]:
             print("\nThe planner found nothing to change.")
             return True
 
-        print("\n2. Coder")
         limit = asyncio.Semaphore(max(1, parallel))
 
-        async def code(name: str, parts: list[Part], context_id: str | None = None) -> None:
-            doing = "fixing" if context_id else "coding"
+        def read_only(name: str) -> dict[str, str]:
+            """The coder may READ every other repo: coded ones through their worktree
+            (so it sees the new code), the rest through your checkout."""
+            return {other: work[other]["worktree"] if work.get(other, {}).get("coded") is not None
+                    else repos[other]["path"] for other in repos if other != name}
+
+        def brief(step: dict) -> str:
+            done = {n: w for n, w in work.items() if w.get("coded") is not None and n != step["name"]}
+            text = coder_brief(request, plan, step, done)
+            leftovers = gitops.uncommitted(work[step["name"]]["worktree"])
+            if leftovers:
+                text += ("\n\nAn earlier attempt at this was interrupted. Its unfinished edits are "
+                         f"still in your worktree: {', '.join(leftovers)}. Check them, keep "
+                         "what is right, and finish the work.")
+            return text
+
+        async def code(name: str, text: str, qa_round: int) -> None:
+            """One coder message. Continues the repo's conversation if there is one,
+            else starts one: then the coder needs the whole brief again."""
+            doing = "fixing" if qa_round else "coding"
+            step = next(s for s in plan["repos"] if s["name"] == name)
+            if name in contexts:
+                parts = [new_text_part(text)]
+            else:
+                parts = [new_text_part(brief(step) + (f"\n\n{text}" if text else "")),
+                         new_data_part({"repo": name, "worktree": work[name]["worktree"],
+                                        "base": work[name]["base"], "read_only": read_only(name)})]
             status.update(repos={name: f"queued for {doing}"})
             async with limit:
                 status.update(repos={name: doing})
                 try:
-                    task = await send(coder, f"coder:{name}", parts, context_id, log)
+                    task = await send(coder, f"coder:{name}", parts, contexts.get(name), log)
                 except BaseException:
                     status.update(repos={name: f"{doing} failed"})
                     raise
-            status.update(repos={name: "fixed" if context_id else "coded"})
-            work[name]["context_id"] = task.context_id  # one conversation per repo
+            contexts[name] = task.context_id  # one conversation per repo
+            work[name]["coded"] = qa_round  # saved: a resume will not redo this
+            status.update(repos={name: "fixed" if qa_round else "coded"})
 
-        status.update(phase="coding")
-        remaining = list(plan["repos"])
+        remaining = [step for step in plan["repos"] if work.get(step["name"], {}).get("coded") is None]
+        if remaining:
+            print("\n2. Coder")
+            status.update(phase="coding")
         while remaining:
             # A wave: every repo whose dependencies are done. They run together.
             wave = next_wave(remaining)
             remaining = [step for step in remaining if step not in wave]
-            finished = dict(work)
             print(f"  -> now: {', '.join(step['name'] for step in wave)}")
-            jobs = []
             for step in wave:
                 name, repo = step["name"], repos[step["name"]]
-                worktree = run_dir / "worktrees" / name
-                base = gitops.add_worktree(repo["path"], worktree, branch, repo["base"])
-                # The coder may READ every other repo: finished ones through their
-                # worktree (so it sees the new code), the rest through your checkout.
-                read_only = {other: finished[other]["worktree"] if other in finished
-                             else repos[other]["path"] for other in repos if other != name}
-                brief = coder_brief(request, plan, step, finished)
-                work[name] = {"worktree": str(worktree), "base": base}
-                jobs.append(code(name, [
-                    new_text_part(brief),
-                    new_data_part({"repo": name, "worktree": str(worktree), "base": base,
-                                   "read_only": read_only}),
-                ]))
-            await all_of(jobs)
+                if name not in work:
+                    worktree = run_dir / "worktrees" / name
+                    base = gitops.add_worktree(repo["path"], worktree, branch, repo["base"])
+                    work[name] = {"worktree": str(worktree), "base": base, "coded": None}
+                    status.save()
+            await all_of([code(step["name"], "", 0) for step in wave])
 
         qa_brief = (f"Request:\n{request}\n\nPlan summary:\n{plan['summary']}\n\n"
                     f"Contract shared by all repositories:\n{plan['contract']}")
@@ -338,12 +405,25 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
              "timeout": repos[name]["timeout"]}
             for name, w in work.items()
         ]
-        qa_context = None
-        for round_number in range(1, MAX_ROUNDS + 1):
+        qa_context = None  # reusing it tells QA the worktrees are already set up
+        while True:
+            verdict, done = st["verdict"], st["qa_round"]
+            if verdict and (verdict["passed"] or done >= st["max_rounds"]):
+                break
+            if verdict:  # QA found problems in round `done`: fix them first
+                todo = [name for name, result in verdict["repos"].items()
+                        if (result["tests"] == "failed" or result["issues"])
+                        and work[name]["coded"] < done]
+                if todo:
+                    print(f"\n2. Coder (fix after round {done})")
+                    status.update(phase=f"fixing (after round {done})")
+                    # Same context_id: each coder remembers the plan and its own work.
+                    await all_of([code(name, feedback(name, verdict["repos"][name]), done)
+                                  for name in todo])
+            round_number = done + 1
             print(f"\n3. QA (round {round_number})")
-            status.update(phase=f"testing (round {round_number} of {MAX_ROUNDS})",
+            status.update(phase=f"testing (round {round_number} of {st['max_rounds']})",
                           repos={name: "testing" for name in work})
-            # Reusing QA's context_id tells it the worktrees are already set up.
             task = await send(qa, "qa", [new_text_part(qa_brief),
                                          new_data_part({"repos": qa_repos})], qa_context, log)
             qa_context = task.context_id
@@ -352,30 +432,28 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
                 print(f"  -> {name}: tests {result['tests']}, {len(result['issues'])} review issue(s)")
                 status.update(repos={name: f"tests {result['tests']}, "
                                            f"{len(result['issues'])} review issue(s)"})
-            if verdict["passed"] or round_number == MAX_ROUNDS:
-                break
-
-            print("\n2. Coder (fix)")
-            status.update(phase=f"fixing (after round {round_number})")
-            # Same context_id: each coder remembers the plan and its own work.
-            await all_of([
-                code(name, [new_text_part(feedback(name, result))], work[name]["context_id"])
-                for name, result in verdict["repos"].items()
-                if result["tests"] == "failed" or result["issues"]
-            ])
+            status.update(verdict=verdict, qa_round=round_number)
     except BaseException as error:  # also Ctrl+C
-        status.update(phase="stopped", error=f"{type(error).__name__}: {error}")
+        interrupted = isinstance(error, (KeyboardInterrupt, asyncio.CancelledError))
+        status.update(phase="stopped", error="interrupted (Ctrl+C)" if interrupted
+                      else f"{type(error).__name__}: {error}")
         raise
     finally:
         await asyncio.gather(planner.close(), coder.close(), qa.close(), return_exceptions=True)
-        report = finish(run_dir, repos, work, branch, verdict, keep_worktrees)
+        stopped = st["phase"] == "stopped"
+        report = finish(run_dir, repos, work, branch, st["verdict"], keep_worktrees or stopped)
+        if stopped:
+            report = report.replace("RESULT: ", "RESULT: STOPPED. ", 1) + (
+                "\n\nThe worktrees were kept, with any unfinished edits. Continue with:\n"
+                f"  devteam resume --run \"{run_dir}\"")
         (run_dir / "summary.md").write_text(report + "\n", encoding="utf-8")
-        if status.data["phase"] != "stopped":
+        if not stopped:
+            verdict = st["verdict"]
             status.update(phase="QA passed" if verdict and verdict["passed"]
                           else "QA did not pass" if verdict else "nothing to change")
         print("\n" + report)
 
-    return bool(verdict and verdict["passed"])
+    return bool(st["verdict"] and st["verdict"]["passed"])
 
 
 async def survey(url: str, folder: str | Path, out: str | Path, hints: str = "",

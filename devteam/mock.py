@@ -6,6 +6,8 @@ The client's first attempt deliberately uses the wrong field name, so you can
 watch QA fail it and the coder fix it.
 """
 
+from pathlib import Path
+
 PLANNER = [
     ("list_files", {"repo": "backend"}),
     ("read_file", {"repo": "backend", "path": "users.py"}),
@@ -60,11 +62,13 @@ _CLIENT_FIX = [
 REVIEW = [("submit_review", {"issues": []})]
 
 
-def coder(repo: str, round_number: int):
+def coder(repo: str, worktree: str):
+    """Chosen by what the code looks like, so a resumed run (new conversation) still fits."""
     if repo == "backend":
         return _BACKEND
     if repo == "client":
-        return _CLIENT_FIRST if round_number == 1 else _CLIENT_FIX
+        display = (Path(worktree) / "display.py").read_text(encoding="utf-8")
+        return _CLIENT_FIX if "user['mail']" in display else _CLIENT_FIRST
     return None
 
 SURVEYOR = [
