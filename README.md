@@ -111,6 +111,19 @@ devteam ask coder web@feature/x -m "Fix the failing date test"
 devteam ask planner api web -m "How would we add SSO?"
 ```
 
+- `--fix` closes the loop when QA or review finds something:
+
+  ```bash
+  devteam ask qa,review web@feature/login --fix      # up to 2 fix rounds (--fix 3 for 3)
+  ```
+
+  Failing tests, QA issues and review findings that block the merge (blocker,
+  major) go to the coder of that repo. It fixes them on a new branch
+  `team/fix-<...>` that starts at your branch, then QA and review check again,
+  now on that branch. Repos without problems are left alone. Each round's
+  reports are kept (`qa-round1.md`, `review-round2.md`, ...). Without `--fix`,
+  you can still hand a report to the coder yourself:
+  `devteam ask coder web@feature/login -m "$(cat .devteam/runs/<run>/qa.md)"`.
 - A target is `repo` (its checked-out commit), `repo@branch-tag-or-commit`, or
   `repo#PR`. No target means every repo in `repos.toml`.
 - It is compared with `--base`, else `base` from `repos.toml`, else origin's

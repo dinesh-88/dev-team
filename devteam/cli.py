@@ -252,6 +252,8 @@ def cmd_ask(parser, args) -> int:
     if "coder" in agents and len(agents) > 1:
         parser.error("the coder changes the code, so run it on its own, not next to agents that check it")
     message = " ".join(args.message or [])
+    if args.fix and not set(agents) <= {"qa", "review"}:
+        parser.error("--fix works with qa and/or review: they find problems, the coder fixes them")
     if agents in (["coder"], ["planner"]) and not message:
         parser.error(f"say what the {agents[0]} should do with -m \"...\"")
     config = find_config(args.config)
@@ -270,17 +272,18 @@ def cmd_ask(parser, args) -> int:
         print(f"  {t.name:<16} {t.label} ({t.head[:10]}) vs {t.base_label} ({t.base[:10]})")
 
     def started(run_dir: Path) -> None:
-        names = [f"coder:{t.name}" for t in targets] if agents == ["coder"] else agents
+        names = [f"coder:{t.name}" for t in targets] if agents == ["coder"] else list(agents)
+        names += ["coder"] * bool(args.fix)
         print("\nFollow each agent in its own terminal:")
         for name in names:
             print(f"  {watch_command(name, run_dir, config)}")
         if args.terminals:
             open_terminals(run_dir, names)
 
-    with agents_running(agents) as urls:
+    with agents_running(agents + ["coder"] * bool(args.fix)) as urls:
         try:
             ok = asyncio.run(ask.ask(agents, targets, message, config, urls, args.keep,
-                                     args.threshold, started))
+                                     args.threshold, started, args.fix))
             return 0 if ok else 1
         except (AgentError, gitops.GitError) as error:
             print(f"\nStopped: {error}")
@@ -468,6 +471,9 @@ def main() -> int:
     ask_cmd.add_argument("-m", "--message", nargs="+", metavar="TEXT",
                          help="instructions or focus (required for coder and planner)")
     ask_cmd.add_argument("--base", metavar="REF", help="compare with this branch or commit")
+    ask_cmd.add_argument("--fix", type=int, nargs="?", const=2, default=0, metavar="N",
+                         help="qa/review: let the coder fix what they find, on a new branch, "
+                         "and check again, up to N times (default 2)")
     ask_cmd.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
                          help="bench: a change bigger than this percent counts (default 5)")
     ask_cmd.add_argument("--keep", action="store_true", help="keep the worktree folders")
