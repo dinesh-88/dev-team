@@ -18,7 +18,11 @@ you ──> orchestrator (A2A client, reads repos.toml)
           └── failures go back to that repo's coder conversation (max 3 rounds)
 ```
 
-A fourth agent, the **Surveyor** (`devteam/surveyor.py`), is used once
+Two more agents, **Review** (`devteam/review.py`) and **Bench**
+(`devteam/bench.py`), and any of the others, can be run on their own on a
+branch or pull request you choose: see [`devteam ask`](#one-agent-any-branch-devteam-ask).
+
+Another agent, the **Surveyor** (`devteam/surveyor.py`), is used once
 before all this: it looks through a folder of repos and writes `repos.toml`.
 
 Each agent is its own process and HTTP server. `devteam` starts them on free
@@ -92,6 +96,58 @@ Start with a small, low-risk request and read the diffs. When it finishes you ge
 
 Nothing is pushed and your checked-out files are not touched. Review with the
 `git diff` command printed at the end, then merge or delete the branch.
+
+## One agent, any branch: `devteam ask`
+
+`devteam run` always goes planner → coder → QA on a new branch. With `ask` you
+pick the agents and the branches, for example to QA a colleague's branch or
+review a pull request:
+
+```bash
+devteam ask qa web@feature/login                 # tests + review of one branch
+devteam ask review api#42                        # GitHub pull request 42 of `api` (needs `gh`)
+devteam ask review,qa,bench api@perf-cache web@perf-cache
+devteam ask coder web@feature/x -m "Fix the failing date test"
+devteam ask planner api web -m "How would we add SSO?"
+```
+
+- A target is `repo` (its checked-out commit), `repo@branch-tag-or-commit`, or
+  `repo#PR`. No target means every repo in `repos.toml`.
+- It is compared with `--base`, else `base` from `repos.toml`, else origin's
+  default branch, from where the branch left it (the merge-base).
+- Agents named together run **at the same time**, each in its own worktrees.
+  `bench` is the exception: it waits for the others and runs alone, so their
+  tests do not distort its timings.
+- Your branches are never moved: checking agents get detached worktrees at the
+  commit. The coder commits to a new `team/<message>-<time>` branch that starts
+  at your branch; merge it into yours if you like the result.
+- Reports land in the run folder (`qa.md`, `review.md`, `benchmark.md`,
+  `plan.md`), and `status`, `watch` and `clean` work as for `run`. The exit
+  code is 0 only if QA passed, the review does not request changes and no
+  benchmark got worse.
+
+### The review agent
+
+Reviews a change on its own merits, as a senior engineer would: bugs, security,
+missing tests, breaking changes, performance. Every finding has a file, line
+and severity (`blocker`, `major`, `minor`, `nit`). The verdict follows from
+those by a fixed rule: any blocker or major → `request_changes`, other
+findings → `comment`, none → `approve`. For a pull request it prints the `gh pr
+review` command that posts `review.md`; it never posts by itself.
+
+QA has a review step too, but a narrower one: it checks that the repos agree
+with each other and with the plan, so the team can loop on it.
+
+### The benchmark agent
+
+Add a `bench` command to a repo in `repos.toml` (and optionally `bench_runs`,
+default 3). The agent runs `setup` and then the benchmark on the base and on the
+branch, alternating, and times each run. The model only reads the output and
+pulls out the numbers (ns/op, requests/s, ...), since every tool prints them
+differently. The code compares them: a change past `--threshold` (default 5%)
+in the wrong direction is a regression. Wall time is always shown, but only
+decides when the output had no numbers of its own. As with tests, the command
+comes from your config, never from the model.
 
 ## Watch the agents work
 
@@ -223,6 +279,7 @@ a data part in `artifacts`.
 2. Let the planner ask you a question: call `updater.requires_input(...)` and
    handle the `input_required` state in the orchestrator.
 3. Add another agent that opens pull requests for the finished branches.
+   Then let `devteam run` call the review agent on them.
 4. Give one agent a different brain (another model or framework) by changing
    only its use of `devteam/brain.py`. Nothing else changes, which is the point
    of A2A.

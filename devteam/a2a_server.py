@@ -113,7 +113,7 @@ def serve(card: AgentCard, agent: TeamAgent, port: int) -> None:
     # Where and how to reach the agent. JSONRPC over HTTP is the most
     # common binding; A2A also defines gRPC and plain REST.
     card.supported_interfaces.append(
-        AgentInterface(protocol_binding="JSONRPC", url=f"http://{HOST}:{port}/")
+        AgentInterface(protocol_binding="JSONRPC", protocol_version="1.0", url=f"http://{HOST}:{port}/")
     )
     handler = DefaultRequestHandler(
         agent_executor=agent,

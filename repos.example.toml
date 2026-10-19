@@ -9,6 +9,8 @@ test = "pytest -q"                    # run by QA inside the worktree; leave out
 setup = "pip install -e ."            # optional: run once in the fresh worktree before the tests
 base = "main"                         # optional: branch to start from (default: what is checked out)
 timeout = 900                         # optional: seconds allowed for setup and for tests
+bench = "pytest benchmarks -q --benchmark-only"   # optional: run by `devteam ask bench`
+bench_runs = 3                        # optional: runs on each side (base and branch)
 
 [[repo]]
 name = "web"

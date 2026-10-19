@@ -77,6 +77,8 @@ def load_repos(config_path: str | Path) -> dict[str, dict]:
             "setup": entry.get("setup", ""),
             "test": entry.get("test", ""),
             "timeout": entry.get("timeout", 900),
+            "bench": entry.get("bench", ""),
+            "bench_runs": entry.get("bench_runs", 3),
         }
     if len(repos) != len(entries) or not repos:
         sys.exit(f"{config_path} needs at least one [[repo]] and every name must be unique.")
@@ -200,6 +202,19 @@ def next_wave(remaining: list[dict]) -> list[dict]:
     return ready or remaining[:1]  # a dependency cycle: just take them in plan order
 
 
+def plan_markdown(plan: dict) -> str:
+    return (f"# Plan\n\n{plan['summary']}\n\n## Contract\n\n{plan['contract']}\n\n"
+            + "\n\n".join(f"## {step['name']}\n\n"
+                          + (f"After: {', '.join(step['after'])}\n\n" if step.get("after") else "")
+                          + step["steps"] for step in plan["repos"]))
+
+
+def text_artifact(task: Task, name: str) -> str:
+    """The text of a named artifact, e.g. a Markdown report."""
+    artifact = next(a for a in task.artifacts if a.name == name)
+    return "\n".join(get_text_parts(artifact.parts))
+
+
 def coder_brief(request: str, plan: dict, step: dict, done: dict[str, dict]) -> str:
     sections = [
         f"Request:\n{request}",
@@ -266,13 +281,7 @@ async def run_team(request: str, config_path: str | Path, urls: dict[str, str],
         unknown = [step["name"] for step in plan["repos"] if step["name"] not in repos]
         if unknown:
             raise AgentError(f"The plan names repos that are not in the config: {unknown}")
-        plan_text = (
-            f"# Plan\n\n{plan['summary']}\n\n## Contract\n\n{plan['contract']}\n\n"
-            + "\n\n".join(f"## {step['name']}\n\n"
-                          + (f"After: {', '.join(step['after'])}\n\n" if step.get("after") else "")
-                          + step["steps"] for step in plan["repos"])
-        )
-        (run_dir / "plan.md").write_text(plan_text + "\n", encoding="utf-8")
+        (run_dir / "plan.md").write_text(plan_markdown(plan) + "\n", encoding="utf-8")
         status.update(repos={step["name"]: "waiting" for step in plan["repos"]})
         print(f"  -> {len(plan['repos'])} repo(s): {', '.join(s['name'] for s in plan['repos']) or 'none'}")
         if not plan["repos"]:

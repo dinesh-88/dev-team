@@ -54,3 +54,37 @@ def remove_worktree(repo: str | Path, worktree: str | Path, branch: str, base: s
         git(repo, "branch", "-D", branch)
         return False
     return True
+
+
+# ---- checking out a branch you already have (devteam ask) --------------------
+
+def commit_of(repo: str | Path, ref: str) -> str:
+    return git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+
+
+def merge_base(repo: str | Path, a: str, b: str) -> str:
+    return git(repo, "merge-base", a, b)
+
+
+def default_branch(repo: str | Path) -> str:
+    """The branch a feature branch is compared with: origin's default, else main or master."""
+    try:
+        return git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    except GitError:
+        pass
+    for name in ("main", "master"):
+        try:
+            commit_of(repo, name)
+            return name
+        except GitError:
+            pass
+    return "HEAD"
+
+
+def add_detached(repo: str | Path, worktree: str | Path, commit: str) -> None:
+    """A worktree at `commit` without a branch: reading and testing it moves none of your branches."""
+    git(repo, "worktree", "add", "--detach", str(worktree), commit)
+
+
+def drop_worktree(repo: str | Path, worktree: str | Path) -> None:
+    git(repo, "worktree", "remove", "--force", str(worktree))

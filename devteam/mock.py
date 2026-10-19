@@ -82,3 +82,15 @@ SURVEYOR = [
          "notes": "Tests assume `python` has pytest installed."},
     ]}),
 ]
+
+REVIEWER = [
+    ("read_file", {"repo": "backend", "path": "users.py"}),
+    ("submit_review", {
+        "summary": "Adds an email to the user returned by get_user(). Small and tested.",
+        "findings": [{"repo": "backend", "file": "users.py", "line": 3, "severity": "minor",
+                      "problem": "Users without an email would raise KeyError in get_user().",
+                      "suggestion": "Use user.get(\"email\") or make email required on creation."}],
+    }),
+]
+
+BENCH = [("submit_metrics", {"summary": "Only wall time was compared in the demo.", "metrics": []})]

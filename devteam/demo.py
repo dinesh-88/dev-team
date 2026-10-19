@@ -68,6 +68,11 @@ def build() -> str:
         shutil.rmtree(WORKSPACE, **{key: _make_writable})
 
     test_command = f'"{sys.executable}" -m pytest -q -p no:cacheprovider'
+    bench_commands = {  # for `devteam ask bench`: timeit prints "N loops, best of 5: X usec per loop"
+        "backend": f'"{sys.executable}" -m timeit -s "from users import get_user" "get_user(1)"',
+        "client": f'"{sys.executable}" -m timeit -s "from display import format_user" '
+                  '"format_user({\'id\': 1, \'name\': \'Ada\', \'email\': \'a@b.c\'})"',
+    }
     config = []
     for name, files in FILES.items():
         repo = WORKSPACE / name
@@ -89,6 +94,7 @@ def build() -> str:
             f"path = {json.dumps(name)}\n"
             f"description = {json.dumps(DESCRIPTIONS[name])}\n"
             f"test = {json.dumps(test_command)}\n"
+            f"bench = {json.dumps(bench_commands[name])}\n"
         )
 
     config_path = WORKSPACE / "repos.toml"

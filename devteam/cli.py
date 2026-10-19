@@ -2,6 +2,7 @@
 
     devteam setup ~/code                 write ./repos.toml for the git repos in ~/code
     devteam run "Add an email field ..." change your repos (listed in repos.toml)
+    devteam ask qa web@feature/x         chosen agents on chosen branches (qa, review, bench, ...)
     devteam demo                         two tiny demo repos, no Claude needed
     devteam watch coder                  follow one agent of the latest run (another terminal)
     devteam status                       how the latest run is doing (--follow to keep watching)
@@ -28,6 +29,7 @@ if sys.version_info < (3, 11):
 import httpx
 
 from devteam import cleanup, gitops, monitor
+from devteam import ask
 from devteam.orchestrator import STATE_DIR, AgentError, load_repos, run_team, survey
 
 PACKAGE_PARENT = Path(__file__).resolve().parent.parent
@@ -41,7 +43,10 @@ AGENTS = {
     "coder": "Implements the plan in one repo worktree (default port 9102)",
     "qa": "Runs the tests and reviews the change across repos (default port 9103)",
     "surveyor": "Describes the repos in a folder for repos.toml (default port 9104)",
+    "review": "Reviews a branch or pull request like a senior engineer (default port 9105)",
+    "bench": "Benchmarks a branch against its base and reports regressions (default port 9106)",
 }
+PORTS = {"planner": 9101, "coder": 9102, "qa": 9103, "surveyor": 9104, "review": 9105, "bench": 9106}
 BRAINS = {
     "subscription": "your Claude Code login (subscription)",
     "api": "Anthropic API key",
@@ -229,6 +234,49 @@ def cmd_run(parser, args) -> int:
     return team(request, config, args.keep, args.parallel, args.terminals)
 
 
+def cmd_ask(parser, args) -> int:
+    agents = list(dict.fromkeys(a.strip() for a in args.agents.split(",") if a.strip()))
+    unknown = [a for a in agents if a not in ask.AGENTS]
+    if not agents or unknown:
+        parser.error(f"choose from {', '.join(ask.AGENTS)} (several with commas, e.g. review,bench)")
+    if "coder" in agents and len(agents) > 1:
+        parser.error("the coder changes the code, so run it on its own, not next to agents that check it")
+    message = " ".join(args.message or [])
+    if agents in (["coder"], ["planner"]) and not message:
+        parser.error(f"say what the {agents[0]} should do with -m \"...\"")
+    config = find_config(args.config)
+    repos = load_repos(config)
+    choose_brain(parser, args.brain, demo=False, allow_mock=True)  # mock: answers for the demo repos
+    try:
+        targets = ask.resolve_targets(args.targets, repos, args.base)
+    except (AgentError, gitops.GitError) as error:
+        print(f"\nStopped: {error}")
+        return 1
+    if "bench" in agents and not any(t.repo["bench"] for t in targets):
+        parser.error("no `bench` command in repos.toml for these repos: add one, e.g. "
+                     "bench = \"pytest benchmarks --benchmark-only\"")
+    print(f"Agents:  {', '.join(agents)}\nConfig:  {config}")
+    for t in targets:
+        print(f"  {t.name:<16} {t.label} ({t.head[:10]}) vs {t.base_label} ({t.base[:10]})")
+
+    def started(run_dir: Path) -> None:
+        names = [f"coder:{t.name}" for t in targets] if agents == ["coder"] else agents
+        print("\nFollow each agent in its own terminal:")
+        for name in names:
+            print(f"  {watch_command(name, run_dir, config)}")
+        if args.terminals:
+            open_terminals(run_dir, names)
+
+    with agents_running(agents) as urls:
+        try:
+            ok = asyncio.run(ask.ask(agents, targets, message, config, urls, args.keep,
+                                     args.threshold, started))
+            return 0 if ok else 1
+        except (AgentError, gitops.GitError) as error:
+            print(f"\nStopped: {error}")
+            return 1
+
+
 def cmd_setup(parser, args) -> int:
     choose_brain(parser, args.brain, demo=False)
     out = Path(args.config).expanduser() if args.config else Path.cwd() / CONFIG_NAME
@@ -348,7 +396,7 @@ def cmd_clean(parser, args) -> int:
 
 def cmd_agent(parser, args) -> int:
     choose_brain(parser, args.brain, demo=False, allow_mock=True)  # mock: answers for the demo repos
-    port = args.port or {"planner": 9101, "coder": 9102, "qa": 9103, "surveyor": 9104}[args.name]
+    port = args.port or PORTS[args.name]
     try:
         return subprocess.call(agent_command(args.name, port), env=agent_env())
     except KeyboardInterrupt:
@@ -376,6 +424,24 @@ def main() -> int:
     run.add_argument("request", nargs="+", help="what you want changed")
     run.add_argument("--config", help=f"default: ./{CONFIG_NAME}, else {USER_CONFIG}")
     run.set_defaults(handler=cmd_run)
+
+    ask_cmd = commands.add_parser(
+        "ask", parents=[brain], help="chosen agents on chosen repos and branches",
+        description=ask.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ask_cmd.add_argument("agents", metavar="AGENT[,AGENT]",
+                         help=f"one or more of {', '.join(ask.AGENTS)}, comma-separated")
+    ask_cmd.add_argument("targets", nargs="*", metavar="REPO[@REF|#PR]",
+                         help="repos from repos.toml (default: all, at HEAD)")
+    ask_cmd.add_argument("-m", "--message", nargs="+", metavar="TEXT",
+                         help="instructions or focus (required for coder and planner)")
+    ask_cmd.add_argument("--base", metavar="REF", help="compare with this branch or commit")
+    ask_cmd.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
+                         help="bench: a change bigger than this percent counts (default 5)")
+    ask_cmd.add_argument("--keep", action="store_true", help="keep the worktree folders")
+    ask_cmd.add_argument("--terminals", action="store_true",
+                         help="open a macOS Terminal window per agent that follows its log")
+    ask_cmd.add_argument("--config", help=f"default: ./{CONFIG_NAME}, else {USER_CONFIG}")
+    ask_cmd.set_defaults(handler=cmd_ask)
 
     setup_cmd = commands.add_parser("setup", parents=[brain], help="write repos.toml for a folder",
                                     description="Find the git repos in FOLDER, let the Surveyor "
